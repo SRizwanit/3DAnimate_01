@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="utf-8" />
+<title>গল্পের ক্যাপশন — Hyperframes ওভারলে (ধাপ ৬)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!--
+  hyperframes.html — ক্যাপশনের HTML কম্পোজিশন (ওভারলে + ব্যাকআপ)
+  • Captions.tsx-এর সাথে হুবহু এক ডেটা: একই গ্রুপ, একই সময় (৩০ fps), একই রঙের সেট, একই নিরাপদ অঞ্চল
+  • কোনো বাইরের লাইব্রেরি লাগে না; শুধু একটি ফন্ট লিংক (অফলাইনে Noto Sans Bengali/sans-serif ফলব্যাক)
+  • ডিফল্টে পটভূমি স্বচ্ছ (ওভারলে হিসেবে ব্যবহারের জন্য)। ব্রাউজারে দেখতে: hyperframes.html?preview=1 (ক্লিকে প্লে/পজ, story01.mp3 একই ফোল্ডারে থাকতে হবে)
+  • ফ্রেম-সঠিক চালাতে: window.seek(সেকেন্ড) — একই ফ্রেমে সবসময় একই ছবি (কোনো এলোমেলো/ঘড়ি-নির্ভর অ্যানিমেশন নেই)
+  • সব মাপ ১০৮০ ভিত্তিক, পর্দার চওড়া অনুযায়ী স্কেল হয় (HD ও 4K দুটোতেই ঠিক)
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@700&display=swap" rel="stylesheet" />
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+  #stage { position: fixed; inset: 0; --u: 1px; overflow: hidden; background: transparent; }
+  body.preview #stage { background: linear-gradient(180deg, #060c2a 0%, #1b3170 55%, #f0a45e 100%); }
+  /* নিরাপদ অঞ্চল (theme.ts-এর SAFE): ক্যাপশন ০.৭৪–০.৯২ উচ্চতায়, দুই পাশে ৮০/১০৮০ */
+  #captions { position: absolute; left: 7.4074%; width: 85.1852%; top: 74%; height: 18%;
+    display: flex; align-items: center; justify-content: center; pointer-events: none; }
+  .grp { display: none; }
+  .grp.on { display: block; max-width: 100%; }
+  .pill { display: flex; flex-wrap: wrap; justify-content: center; align-items: baseline; box-sizing: border-box; max-width: 100%;
+    column-gap: calc(23.4 * var(--u)); row-gap: calc(10 * var(--u));
+    padding: calc(22 * var(--u)) calc(44 * var(--u)); border-radius: calc(48 * var(--u));
+    border: calc(2 * var(--u)) solid rgba(255,255,255,0.10);
+    backdrop-filter: blur(calc(6 * var(--u))); -webkit-backdrop-filter: blur(calc(6 * var(--u)));
+    box-shadow: 0 calc(10 * var(--u)) calc(30 * var(--u)) rgba(0,0,0,0.25);
+    transform-origin: 50% 100%; }
+  .w { position: relative; display: inline-block; transform-origin: 50% 75%; }
+  .w .bk, .w .fr {
+    font-family: "Hind Siliguri", "Noto Sans Bengali", "Noto Sans", sans-serif; font-size: calc(78 * var(--u));
+    font-weight: 700; line-height: 1.28; letter-spacing: 0; white-space: nowrap;   /* বাংলা যুক্তাক্ষর ও শব্দ কখনো ভাঙবে না */
+    font-kerning: normal; font-variant-ligatures: normal; text-rendering: optimizeLegibility; }
+  .w .bk { position: absolute; left: 0; top: 0; -webkit-text-stroke: calc(10 * var(--u)) var(--stroke); color: var(--stroke); }
+  .w .fr { position: relative; }
+  .w .ul { position: absolute; left: 6%; right: 6%; bottom: calc(-1 * var(--u)); height: calc(7 * var(--u));
+    border-radius: calc(4 * var(--u)); transform-origin: 0 50%; opacity: 0; }
+  #hint { position: fixed; left: 12px; top: 12px; color: #fff; font: 14px sans-serif; opacity: .7; display: none; }
+  body.preview #hint { display: block; }
+</style>
+</head>
+<body>
+<div id="hint">ক্লিক = প্লে/পজ · ←/→ = ১ সেকেন্ড</div>
+
+<!-- Hyperframes কম্পোজিশন: মূল ফ্রেম 1080×1920, ৩০ fps -->
+<div id="stage" data-composition-id="story-captions" data-start="0" data-duration="71.3" data-width="1080" data-height="1920" data-fps="30">
+  <audio id="voice" src="story01.mp3" preload="auto" data-start="0" data-duration="70.27" data-track-index="0" data-volume="1"></audio>
+  <div id="captions" class="clip" data-start="0" data-duration="71.3" data-track-index="1"></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  // ---- ডেটা (Captions.tsx-এর CAPTION_GROUPS ও theme.ts-এর CAPTION_PALETTES থেকে তৈরি) ----
+  // গ্রুপ: [দৃশ্য, প্যালেট, showFrom, showTo, fadeOut, [[শব্দ, সক্রিয়-শুরু-ফ্রেম], ...]]
+  var D = {
+    "fps": 30, "durationS": 71.3, "activeScale": 1.14,
+    "spring": {"damping":12,"stiffness":170,"mass":0.6},
+    "palettes": [
+      {"text":"#ffffff","active":"#ffd23f","accent":"#ff7a1a","stroke":"#1a1030","glow":"#ffb347","pill":"rgba(10,12,40,0.45)"},
+      {"text":"#fff7e6","active":"#7ef0c8","accent":"#2fd1a0","stroke":"#0a2a2a","glow":"#5ee6c0","pill":"rgba(8,30,34,0.45)"},
+      {"text":"#ffffff","active":"#ff8fb8","accent":"#ff4f94","stroke":"#2a0f26","glow":"#ff7aa8","pill":"rgba(36,10,34,0.45)"},
+      {"text":"#f2f7ff","active":"#7cc6ff","accent":"#2f9bff","stroke":"#0a1a3a","glow":"#6bb8ff","pill":"rgba(8,16,48,0.45)"},
+      {"text":"#fffbe8","active":"#ffe14d","accent":"#ff5a3c","stroke":"#3a1408","glow":"#ffcb3d","pill":"rgba(40,16,8,0.45)"},
+      {"text":"#ffffff","active":"#ff6b6b","accent":"#ffb347","stroke":"#240808","glow":"#ff5252","pill":"rgba(34,8,14,0.5)"},
+      {"text":"#f4f0ff","active":"#c9a2ff","accent":"#8f5bff","stroke":"#150c33","glow":"#b386ff","pill":"rgba(16,10,44,0.45)"},
+      {"text":"#eefcff","active":"#9dfcff","accent":"#35e0f0","stroke":"#06242e","glow":"#6df0ff","pill":"rgba(6,24,38,0.45)"}
+    ],
+    "groups": [
+      [1,0,0,131,5,[["ঘটনাটির",-1],["সময়",21],["উনিশশো",73],["ছিয়াত্তর",93],["সাল।",110]]],
+      [2,1,141,210,2,[["নড়াইল",146],["জেলার",162],["লোহাগাড়া",177],["উপজেলার",195]]],
+      [2,1,210,312,5,[["লাহুরিয়া",215],["ইউনিয়নের",233],["ছোট্ট",249],["গ্রাম",267],["লাহুরিয়া।",285]]],
+      [3,2,319,381,0,[["এই",324],["গ্রামেই",335],["প্রহ্লাদ",352],["বিশ্বাস,",371]]],
+      [3,2,381,434,0,[["তার",386],["স্ত্রী,",398],["তার",417],["তিন",427]]],
+      [3,2,434,523,5,[["ছেলে",439],["প্রভাষ,",454],["পঙ্কজ",474],["ও",488],["প্রকাশ।",500]]],
+      [4,3,523,572,0,[["প্রভাসের",527],["বয়স",541],["পঁয়ত্রিশ,",558]]],
+      [4,3,572,646,5,[["পঙ্কজের",576],["বয়স",590],["তিরিশের",605],["কাছাকাছি।",620]]],
+      [5,4,646,692,0,[["বড়",651],["এবং",661],["মেজো",672],["ছেলেকে",684]]],
+      [5,4,692,754,5,[["প্রহ্লাদ",697],["বিশ্বাস",711],["বিয়ে",722],["দিয়েছেন।",736]]],
+      [6,1,754,833,5,[["একান্নবর্তী",759],["পরিবারে",780],["তাদের",795],["বসবাস।",811]]],
+      [7,5,834,901,2,[["কিন্তু",839],["ছেলের",853],["বউ",866],["এবং",880],["ছেলের",891]]],
+      [7,5,901,953,0,[["পরিবারের",905],["সাথে",918],["প্রহ্লাদ",930],["বিশ্বাস",944]]],
+      [7,5,953,1008,1,[["ও",955],["তার",962],["স্ত্রীর",972],["বনিবনা",987],["না",1000]]],
+      [7,5,1008,1072,0,[["হওয়ায়",1013],["ছোট",1028],["ছেলে",1039],["প্রকাশকে",1052],["নিয়ে",1065]]],
+      [8,6,1072,1120,1,[["তাদের",1076],["বাড়ি",1087],["থেকে",1097],["কিছুটা",1110]]],
+      [8,6,1120,1176,0,[["দূরে",1125],["তাদেরই",1141],["দীর্ঘদিন",1157],["ধরে",1170]]],
+      [8,6,1176,1225,1,[["পতিত",1181],["থাকা",1192],["একটি",1203],["জমিতে",1216]]],
+      [8,6,1225,1285,5,[["তিনটি",1230],["ঘর",1241],["নির্মাণ",1253],["করেন।",1267]]],
+      [9,7,1285,1324,0,[["ওই",1290],["জমির",1300],["চতুরদিকে",1313]]],
+      [9,7,1324,1367,5,[["রয়েছে",1327],["ফসলি",1340],["জমি।",1352]]],
+      [10,0,1367,1422,5,[["সেটি",1372],["আসলে",1381],["কোনো",1390],["গ্রাম",1400],["নয়।",1410]]],
+      [10,0,1422,1498,5,[["গ্রামটা",1427],["ফসলি",1442],["জমির",1455],["ঠিক",1468],["পাশে।",1481]]],
+      [11,3,1498,1556,0,[["যেখানে",1503],["ঘর",1516],["নির্মাণ",1527],["করেন",1538],["প্রহ্লাদ",1548]]],
+      [11,3,1556,1620,0,[["বিশ্বাস,",1561],["সেখান",1576],["থেকে",1587],["অন্য",1597],["বাড়িগুলোতে",1610]]],
+      [11,3,1620,1676,0,[["যেতে",1625],["পায়ে",1637],["হেঁটে",1647],["প্রায়",1658],["১০",1670]]],
+      [11,3,1676,1738,5,[["থেকে",1679],["১৫",1689],["মিনিট",1700],["সময়",1711],["লাগে।",1722]]],
+      [12,6,1738,1802,1,[["বলতে",1742],["পারেন",1755],["যে",1766],["ওই",1776],["চতুরদিকে",1790]]],
+      [12,6,1802,1885,5,[["ফসলি",1807],["জমির",1819],["মাঝখানে",1835],["একটি",1851],["ভিটা।",1864]]],
+      [13,2,1887,1934,0,[["সেখানে",1892],["প্রহ্লাদ",1908],["বিশ্বাস,",1923]]],
+      [13,2,1934,2002,0,[["তার",1939],["স্ত্রী",1953],["এবং",1969],["তার",1980],["সন্তানকে",1993]]],
+      [13,2,2002,2042,2,[["নিয়ে",2006],["একটি",2019],["মাত্র",2032]]],
+      [13,2,2042,2111,5,[["পরিবার",2046],["সেখানে",2061],["বসবাস",2077],["করে।",2092]]]
+    ]
+  };
+
+  var FPS = D.fps, stage = document.getElementById("stage"), host = document.getElementById("captions");
+  var U = 1;
+
+  // ---- হেল্পার ----
+  function hex(h) { h = h.replace("#", ""); return [parseInt(h.substr(0, 2), 16), parseInt(h.substr(2, 2), 16), parseInt(h.substr(4, 2), 16)]; }
+  function lerp(a, b, t) {
+    var A = hex(a), B = hex(b), k = Math.min(1, Math.max(0, t));
+    function m(x, y) { var v = Math.round(x + (y - x) * k).toString(16); return v.length < 2 ? "0" + v : v; }
+    return "#" + m(A[0], B[0]) + m(A[1], B[1]) + m(A[2], B[2]);
+  }
+  function rgba(h, a) { var c = hex(h); return "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + a + ")"; }
+  function clamp01(x) { return Math.min(1, Math.max(0, x)); }
+  // Remotion-এর spring-এর সমতুল্য (underdamped স্প্রিং-এর সূত্র), t = সেকেন্ড
+  function spring(t) {
+    if (t <= 0) return 0;
+    var c = D.spring.damping, k = D.spring.stiffness, m = D.spring.mass;
+    var w0 = Math.sqrt(k / m), z = c / (2 * Math.sqrt(k * m)), wd = w0 * Math.sqrt(1 - z * z);
+    return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t));
+  }
+
+  // ---- DOM তৈরি (একবার) ----
+  var groups = D.groups.map(function (g) {
+    var p = D.palettes[g[1]] || D.palettes[0];
+    var grp = document.createElement("div"); grp.className = "grp"; grp.setAttribute("lang", "bn");
+    var pill = document.createElement("div"); pill.className = "pill";
+    pill.style.background = p.pill; pill.style.setProperty("--stroke", p.stroke);
+    var words = g[5].map(function (w) {
+      var s = document.createElement("span"); s.className = "w";
+      var bk = document.createElement("span"); bk.className = "bk"; bk.setAttribute("aria-hidden", "true"); bk.textContent = w[0];
+      var fr = document.createElement("span"); fr.className = "fr"; fr.textContent = w[0];
+      var ul = document.createElement("span"); ul.className = "ul"; ul.setAttribute("aria-hidden", "true");
+      ul.style.background = p.accent;
+      s.appendChild(bk); s.appendChild(fr); s.appendChild(ul); pill.appendChild(s);
+      return { el: s, bk: bk, fr: fr, ul: ul, a: w[1] };
+    });
+    grp.appendChild(pill); host.appendChild(grp);
+    return { sceneId: g[0], p: p, from: g[2], to: g[3], fade: g[4], grp: grp, pill: pill, words: words };
+  });
+
+  var current = -1;
+
+  // ---- ফ্রেম আঁকা: t = সেকেন্ড ----
+  function render(t) {
+    U = stage.clientWidth / 1080; stage.style.setProperty("--u", U + "px");
+    var f = t * FPS, idx = -1, i;
+    for (i = 0; i < groups.length; i++) { if (f >= groups[i].from && f < groups[i].to) { idx = i; break; } }
+    if (idx !== current) {
+      if (current >= 0) groups[current].grp.classList.remove("on");
+      if (idx >= 0) groups[idx].grp.classList.add("on");
+      current = idx;
+    }
+    if (idx < 0) return;
+    var g = groups[idx], p = g.p, local = f - g.from;
+    var enter = spring(local / FPS);
+    var enterOp = clamp01(local / 4);
+    var exitOp = g.fade > 0 ? 1 - clamp01((f - (g.to - g.fade)) / g.fade) : 1;
+    g.pill.style.opacity = enterOp * exitOp;
+    g.pill.style.transform = "translateY(" + ((1 - enter) * 34 * U) + "px) scale(" + (0.86 + 0.14 * enter) + ")";
+    for (i = 0; i < g.words.length; i++) {
+      var w = g.words[i];
+      var aStart = w.a, aEnd = i < g.words.length - 1 ? g.words[i + 1].a : Infinity;
+      var since = f - aStart;
+      var inAmt = since < 0 ? 0 : spring(since / FPS);
+      var outAmt = f < aEnd ? 1 : 1 - clamp01((f - aEnd) / 4);
+      var act = inAmt * outAmt, k = clamp01(act);
+      var pop = 1 + (D.activeScale - 1) * act;
+      var hop = since >= 0 && since < 9 ? Math.sin(since / 9 * Math.PI) : 0;
+      var lift = k > 0 ? -15 * U * hop : 0;
+      var tilt = (i % 2 === 0 ? -1 : 1) * 2 * k * hop;
+      w.el.style.transform = "translateY(" + lift + "px) scale(" + pop + ") rotate(" + tilt + "deg)";
+      w.fr.style.color = lerp(p.text, p.active, k);
+      w.bk.style.textShadow = "0 " + 7 * U + "px " + 14 * U + "px rgba(0,0,0,0.55)" +
+        (k > 0.01 ? ", 0 0 " + 30 * U + "px " + rgba(p.glow, 0.85 * k) : "");
+      if (k > 0.01) {
+        w.ul.style.opacity = Math.min(1, k * 1.5); w.ul.style.transform = "scaleX(" + k + ")";
+        w.ul.style.boxShadow = "0 0 " + 12 * U + "px " + rgba(p.accent, 0.8);
+      } else { w.ul.style.opacity = 0; }
+    }
+  }
+
+  // ---- বাইরে থেকে চালানোর পথ (Hyperframes-ধাঁচের টাইমলাইন + সরাসরি seek) ----
+  var timeNow = 0;
+  var timeline = {
+    duration: function () { return D.durationS; },
+    time: function (t) { if (t === undefined) return timeNow; timeNow = t; render(t); return timeline; },
+    seek: function (t) { timeNow = t; render(t); return timeline; },
+    pause: function () { return timeline; }, play: function () { return timeline; },
+    paused: function () { return true; }
+  };
+  window.__timelines = window.__timelines || {};
+  window.__timelines["story-captions"] = timeline;
+  window.seek = function (t) { timeline.seek(t); };
+  window.__captionsData = D;
+
+  // ---- ব্রাউজারে প্রিভিউ (?preview=1) ----
+  var qs = new URLSearchParams(location.search);
+  var audio = document.getElementById("voice");
+  if (qs.get("preview")) {
+    document.body.classList.add("preview");
+    var playing = false, t0 = 0, base = 0;
+    function tick() {
+      if (playing) {
+        var t = audio && !audio.paused && !audio.ended ? audio.currentTime : base + (performance.now() - t0) / 1000;
+        if (t >= D.durationS) { playing = false; t = D.durationS; }
+        timeline.seek(t);
+        requestAnimationFrame(tick);
+      }
+    }
+    function toggle() {
+      playing = !playing;
+      if (playing) {
+        if (timeNow >= D.durationS - 0.05) timeNow = 0;
+        base = timeNow; t0 = performance.now();
+        try { audio.currentTime = timeNow; audio.play(); } catch (e) {}
+        tick();
+      } else { try { audio.pause(); } catch (e) {} }
+    }
+    document.addEventListener("click", toggle);
+    document.addEventListener("keydown", function (e) {
+      var d = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+      if (d) { timeline.seek(Math.max(0, Math.min(D.durationS, timeNow + d))); if (playing) { base = timeNow; t0 = performance.now(); try { audio.currentTime = timeNow; } catch (x) {} } }
+    });
+  }
+  var q = qs.get("t");
+  timeline.seek(q !== null ? parseFloat(q) : 0);
+  window.addEventListener("resize", function () { timeline.seek(timeNow); });
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { timeline.seek(timeNow); });
+  window.__captionsReady = true;
+})();
+</script>
+</body>
+</html>
