@@ -4,15 +4,17 @@
 #   • repo-তে push করলে (শুধু .md ফাইল বদলালে চলে না)
 #   • হাতে চালালে: Actions ট্যাব → "Render Story Video" → Run workflow
 #
-# কী করে: HD (1080×1920) ও 4K (2160×3840) আলাদা দুটি জবে একসাথে রেন্ডার করে, শেষে MP4 আর্টিফ্যাক্ট হিসেবে জমা রাখে।
-# ডাউনলোড: রানের পাতার নিচে "Artifacts" অংশ থেকে (বিস্তারিত README.md-তে)।
+# কী করে: HD (1080×1920) ও 4K (2160×3840) — প্রতিটি ফরম্যাটের ভিডিও ৫০০ ফ্রেমের টুকরোয় (০–৪৯৯, ৫০০–৯৯৯ …) ভাগ হয়ে
+#         আলাদা আলাদা জবে একসাথে (প্যারালাল) রেন্ডার হয়। প্রতিটি টুকরো শেষ হওয়ামাত্র সেটির MP4 আর্টিফ্যাক্ট হিসেবে জমা হয়
+#         (part-hd-00000-00499 ইত্যাদি)। সব টুকরো শেষ হলে "জোড়া" জব সেগুলো এক করে সম্পূর্ণ MP4 বানায়।
+# ডাউনলোড: রানের পাতার নিচে "Artifacts" অংশ থেকে — টুকরো (part-…) ও সম্পূর্ণ ভিডিও (story-hd / story-4k) (বিস্তারিত README.md-তে)।
+#
+# টাইমআউট: কোনো timeout-minutes দেওয়া নেই। তাই GitHub-এর ডিফল্ট ৩৬০ মিনিট (৬ ঘণ্টা) প্রতি জবে প্রযোজ্য — এবং এখন
+#          প্রতিটি টুকরো আলাদা জব, তাই প্রতিটির নিজস্ব ৬ ঘণ্টা (আগে পুরো ভিডিওর জন্য একটি জবে ছিল)।
 
 name: Render Story Video
 
 on:
-  push:
-    paths-ignore:
-      - "**.md"
   workflow_dispatch:
     inputs:
       formats:
@@ -27,6 +29,10 @@ on:
         description: "ঐচ্ছিক: শুধু কিছু ফ্রেম রেন্ডার (যেমন 0-90 = প্রথম ৩ সেকেন্ড)। ফাঁকা = পুরো ভিডিও (০–২১৩৮)"
         type: string
         default: ""
+      chunk_size:
+        description: "প্রতি টুকরোয় কত ফ্রেম (ডিফল্ট ৫০০)। ফাঁকা = ৫০০"
+        type: string
+        default: "500"
       hyperframes:
         description: "ঐচ্ছিক ও অযাচাইকৃত: hyperframes.html থেকে আলাদা ক্যাপশন-ওভারলে রেন্ডারের চেষ্টা (ব্যর্থ হলে মূল ভিডিওতে প্রভাব নেই)"
         type: boolean
@@ -41,15 +47,101 @@ permissions:
   contents: read
 
 jobs:
-  render:
-    name: Render ${{ matrix.format }}
+  # ধাপ ১: মোট ফ্রেম গুনে ৫০০-র টুকরোর তালিকা বানানো (scenes.ts থেকে মোট ফ্রেম নেয়; না পেলে ২১৩৯)
+  plan:
+    name: টুকরোর পরিকল্পনা
     runs-on: ubuntu-24.04
-    # 4K-র জন্য বড় টাইমআউট (GitHub-hosted runner-এর সর্বোচ্চ ৩৬০ মিনিট)
-    timeout-minutes: ${{ matrix.format == '4k' && 350 || 120 }}
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+      count: ${{ steps.plan.outputs.count }}
+      fps: ${{ steps.plan.outputs.fps }}
+      first: ${{ steps.plan.outputs.first }}
+      last: ${{ steps.plan.outputs.last }}
+    steps:
+      - name: কোড নামানো
+        uses: actions/checkout@v4
+
+      - name: টুকরোর তালিকা বানানো
+        id: plan
+        env:
+          FRAME_RANGE: ${{ inputs.frame_range }}
+          CHUNK_SIZE: ${{ inputs.chunk_size }}
+        run: |
+          set -euo pipefail
+          # scenes.ts: TOTAL_FRAMES = ceil(AUDIO_MS/1000 × FPS) + TAIL_FRAMES
+          FPS_V=$(grep -oP 'export const FPS\s*=\s*\K[0-9]+' scenes.ts || true)
+          AUDIO_MS_V=$(grep -oP 'export const AUDIO_MS\s*=\s*\K[0-9]+' scenes.ts || true)
+          TAIL_RAW=$(grep -oP 'export const TAIL_FRAMES\s*=\s*\K[A-Za-z0-9_]+' scenes.ts || true)
+          TAIL_V=""
+          if [ "${TAIL_RAW}" = "FPS" ]; then TAIL_V="${FPS_V}"; elif [[ "${TAIL_RAW}" =~ ^[0-9]+$ ]]; then TAIL_V="${TAIL_RAW}"; fi
+          if [ -n "${FPS_V}" ] && [ -n "${AUDIO_MS_V}" ] && [ -n "${TAIL_V}" ]; then
+            TOTAL=$(( (AUDIO_MS_V * FPS_V + 999) / 1000 + TAIL_V ))
+          else
+            echo "::warning::scenes.ts থেকে মোট ফ্রেম পড়া যায়নি; ডিফল্ট ২১৩৯ ফ্রেম (৩০ fps) ধরা হলো"
+            TOTAL=2139; FPS_V=30
+          fi
+          export TOTAL FPS_V
+          python3 - <<'PY'
+          import json, os, re, sys
+
+          def fail(msg):
+              print("::error::" + msg)
+              sys.exit(1)
+
+          total = int(os.environ["TOTAL"])
+          fps = int(os.environ["FPS_V"])
+          last = total - 1
+          fr = os.environ.get("FRAME_RANGE", "").strip()
+          cs = os.environ.get("CHUNK_SIZE", "").strip() or "500"
+          if not re.fullmatch(r"[0-9]+", cs) or int(cs) < 1:
+              fail("chunk_size ভুল: '%s' — ১ বা তার বেশি একটি সংখ্যা লিখুন" % cs)
+          cs = int(cs)
+          if fr:
+              if not re.fullmatch(r"[0-9]+(-[0-9]+)?", fr):
+                  fail("frame_range ভুল: '%s' — ০-৯০ বা ১২০ এর মতো লিখুন (শুধু সংখ্যা ও একটি ড্যাশ)" % fr)
+              a, _, b = fr.partition("-")
+              start = int(a)
+              end = int(b) if b else start
+          else:
+              start, end = 0, last
+          if start > end or end > last:
+              fail("frame_range '%s' সঠিক নয়; বৈধ সীমা ০–%d" % (fr, last))
+
+          chunks = []
+          s = start
+          while s <= end:
+              e = min(s + cs - 1, end)
+              chunks.append({"start": s, "end": e, "label": "%05d-%05d" % (s, e)})
+              s = e + 1
+          if len(chunks) * 2 > 256:
+              fail("টুকরো অনেক বেশি (%d); chunk_size বাড়ান (matrix-এ সর্বোচ্চ ২৫৬ জব)" % len(chunks))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as o:
+              o.write("chunks=%s\n" % json.dumps(chunks, separators=(",", ":")))
+              o.write("count=%d\n" % len(chunks))
+              o.write("fps=%d\n" % fps)
+              o.write("first=%d\n" % start)
+              o.write("last=%d\n" % end)
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as o:
+              o.write("### টুকরোর পরিকল্পনা\n")
+              o.write("মোট ফ্রেম: %d (০–%d), রেন্ডার-সীমা: %d–%d, টুকরো: %d টি (প্রতি ফরম্যাটে)\n\n" % (total, last, start, end, len(chunks)))
+              for c in chunks:
+                  o.write("- `%s` (ফ্রেম %d–%d)\n" % (c["label"], c["start"], c["end"]))
+          print("টুকরো:", len(chunks), "টি")
+          PY
+
+  # ধাপ ২: প্রতিটি ফরম্যাট × প্রতিটি ৫০০-ফ্রেমের টুকরো — আলাদা জবে একসাথে রেন্ডার; প্রতিটি শেষ হলেই আউটপুট (আর্টিফ্যাক্ট) জমা
+  render:
+    name: Render ${{ matrix.format }} · ফ্রেম ${{ matrix.chunk.label }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    # timeout-minutes ইচ্ছা করেই দেওয়া নেই (ডিফল্ট: GitHub-hosted runner-এ ৩৬০ মিনিট/জব)
     strategy:
-      fail-fast: false   # একটি ব্যর্থ হলেও অন্যটি চলবে
+      fail-fast: false   # একটি টুকরো ব্যর্থ হলেও বাকিগুলো চলবে (সম্পন্ন টুকরোর আউটপুট থেকে যায়)
       matrix:
         format: ${{ fromJSON(inputs.formats == 'hd' && '["hd"]' || inputs.formats == '4k' && '["4k"]' || '["hd","4k"]') }}
+        chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
 
     steps:
       - name: কোড নামানো
@@ -82,37 +174,120 @@ jobs:
       - name: প্যাকেজ ইনস্টল
         run: npm install --no-audit --no-fund
 
-      - name: রেন্ডার (${{ matrix.format }})
+      - name: রেন্ডার (${{ matrix.format }} · ফ্রেম ${{ matrix.chunk.label }})
         env:
-          FRAME_RANGE: ${{ inputs.frame_range }}
+          START_FRAME: ${{ matrix.chunk.start }}
+          END_FRAME: ${{ matrix.chunk.end }}
           # matrix-এর include ব্যবহার করা হয়নি (ফরম্যাট বেছে নিলে বাড়তি জব তৈরি হত); তাই মান এখানেই ঠিক হয়
           COMPOSITION: ${{ matrix.format == '4k' && 'Story-4K' || 'Story-HD' }}
-          OUT_FILE: ${{ matrix.format == '4k' && 'out-4k.mp4' || 'out-hd.mp4' }}
+          OUT_FILE: part-${{ matrix.format }}-${{ matrix.chunk.label }}.mp4
           # 4K-তে কম কনকারেন্সি (১): মেমোরি ও 3D (CPU) রেন্ডার সামলাতে; HD-তে ২
           CONCURRENCY: ${{ matrix.format == '4k' && 1 || 2 }}
         run: |
           set -euo pipefail
-          EXTRA=()
-          if [ -n "${FRAME_RANGE}" ]; then
-            if [[ ! "${FRAME_RANGE}" =~ ^[0-9]+(-[0-9]+)?$ ]]; then
-              echo "frame_range ভুল: '${FRAME_RANGE}' — ০-৯০ বা ১২০ এর মতো লিখুন (শুধু সংখ্যা ও একটি ড্যাশ)"; exit 1
-            fi
-            EXTRA+=("--frames=${FRAME_RANGE}")
-            echo "শুধু ফ্রেম ${FRAME_RANGE} রেন্ডার হচ্ছে"
-          fi
-          npx remotion render index.ts "${COMPOSITION}" "${OUT_FILE}" --concurrency="${CONCURRENCY}" "${EXTRA[@]}"
+          echo "শুধু ফ্রেম ${START_FRAME}–${END_FRAME} রেন্ডার হচ্ছে (${COMPOSITION})"
+          npx remotion render index.ts "${COMPOSITION}" "${OUT_FILE}" --concurrency="${CONCURRENCY}" --frames="${START_FRAME}-${END_FRAME}"
           ls -lh "${OUT_FILE}"
           {
-            echo "### ${COMPOSITION} ✅"
+            echo "### ${COMPOSITION} · ফ্রেম ${START_FRAME}–${END_FRAME} ✅"
             echo "ফাইল: \`${OUT_FILE}\` — $(du -h "${OUT_FILE}" | cut -f1)"
-            [ -n "${FRAME_RANGE}" ] && echo "ফ্রেম-সীমা: ${FRAME_RANGE} (পুরো ভিডিও নয়)"
           } >> "$GITHUB_STEP_SUMMARY" || true
 
-      - name: ফলাফল আর্টিফ্যাক্ট হিসেবে জমা
+      # প্রতিটি টুকরো শেষ হওয়ামাত্র তার আউটপুট জমা (বাকি টুকরোর জন্য অপেক্ষা করে না)
+      - name: টুকরোর আউটপুট জমা
+        uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.format }}-${{ matrix.chunk.label }}
+          path: part-${{ matrix.format }}-${{ matrix.chunk.label }}.mp4
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0   # MP4 আগে থেকেই সংকুচিত; আবার জিপ করে সময় নষ্ট নয়
+
+  # ধাপ ৩: সব টুকরো জোড়া লাগিয়ে সম্পূর্ণ ভিডিও (ভিডিও কপি হয়, আবার এনকোড নয় — তাই মান অপরিবর্তিত ও দ্রুত)
+  #         অডিও: টুকরো-টুকরো অডিও জুড়লে সংযোগস্থলে সূক্ষ্ম ফাঁক/ক্লিক হতে পারে; তাই story01.mp3 থেকে একবারেই
+  #         সম্পূর্ণ অডিও বসানো হয় (Video.tsx-এ <Audio src={story} /> ০ ফ্রেম থেকে চলে — আর কোনো অডিও নেই)
+  merge:
+    name: জোড়া লাগানো (${{ matrix.format }})
+    needs: [plan, render]
+    # কিছু টুকরো ব্যর্থ হলেও চলে; নিচে টুকরোর সংখ্যা মিলিয়ে অসম্পূর্ণ হলে পরিষ্কার ত্রুটি দেয়
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-24.04
+    # timeout-minutes ইচ্ছা করেই দেওয়া নেই
+    strategy:
+      fail-fast: false
+      matrix:
+        format: ${{ fromJSON(inputs.formats == 'hd' && '["hd"]' || inputs.formats == '4k' && '["4k"]' || '["hd","4k"]') }}
+
+    steps:
+      - name: কোড নামানো (story01.mp3-র জন্য)
+        uses: actions/checkout@v4
+
+      - name: টুকরোগুলো নামানো
+        uses: actions/download-artifact@v4
+        with:
+          pattern: part-${{ matrix.format }}-*
+          merge-multiple: true
+          path: parts
+
+      - name: ffmpeg
+        run: command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+
+      - name: টুকরো জোড়া (${{ matrix.format }})
+        env:
+          FORMAT: ${{ matrix.format }}
+          OUT_FILE: out-${{ matrix.format }}.mp4
+          EXPECTED_COUNT: ${{ needs.plan.outputs.count }}
+          FPS: ${{ needs.plan.outputs.fps }}
+          FIRST_FRAME: ${{ needs.plan.outputs.first }}
+          LAST_FRAME: ${{ needs.plan.outputs.last }}
+          AUDIO_FILE: story01.mp3
+        run: |
+          set -euo pipefail
+          mapfile -t PARTS < <(find parts -maxdepth 1 -type f -name "part-${FORMAT}-*.mp4" | sort)
+          echo "পাওয়া টুকরো: ${#PARTS[@]} টি (দরকার ${EXPECTED_COUNT} টি)"
+          if [ "${#PARTS[@]}" -ne "${EXPECTED_COUNT}" ]; then
+            echo "::error::${FORMAT}: টুকরো অসম্পূর্ণ (${#PARTS[@]}/${EXPECTED_COUNT}) — ব্যর্থ রেন্ডার জবটি আবার চালান (Re-run failed jobs), তারপর জোড়া হবে"
+            printf '%s\n' "${PARTS[@]}"
+            exit 1
+          fi
+          if [ ! -f "${AUDIO_FILE}" ]; then
+            echo "::error::${AUDIO_FILE} পাওয়া যায়নি (অডিও বসাতে লাগে)"; exit 1
+          fi
+
+          # ১) প্রতিটি টুকরোর শুধু ভিডিও (অডিও বাদ) নিয়ে তালিকা; ভিডিও-ধারা কপি করে জোড়া
+          : > list.txt
+          for f in "${PARTS[@]}"; do
+            echo "file '${PWD}/${f}'" >> list.txt
+          done
+          cat list.txt
+          ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i list.txt -an -c:v copy -movflags +faststart video-only.mp4
+
+          # ২) সম্পূর্ণ অডিও একবারে বসানো (রেন্ডার-সীমা শুরু ফ্রেম থেকে; ভিডিও শেষ হলে থামে, ছোট হলে নীরবতা)
+          AUDIO_START=$(awk -v s="${FIRST_FRAME}" -v f="${FPS}" 'BEGIN{printf "%.6f", s/f}')
+          ffmpeg -hide_banner -loglevel error -y -i video-only.mp4 -ss "${AUDIO_START}" -i "${AUDIO_FILE}" \
+            -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -ar 48000 -af apad -shortest \
+            -movflags +faststart "${OUT_FILE}"
+
+          # ৩) যাচাই: ফ্রেম-সংখ্যা মিলছে কিনা
+          EXPECTED_FRAMES=$(( LAST_FRAME - FIRST_FRAME + 1 ))
+          ACTUAL_FRAMES=$(ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "${OUT_FILE}")
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "${OUT_FILE}")
+          ls -lh "${OUT_FILE}"
+          echo "ফ্রেম: ${ACTUAL_FRAMES} (আশা: ${EXPECTED_FRAMES}), দৈর্ঘ্য: ${DURATION} সে"
+          if [ "${ACTUAL_FRAMES}" != "${EXPECTED_FRAMES}" ]; then
+            echo "::warning::${FORMAT}: ফ্রেম-সংখ্যা মেলেনি (পাওয়া ${ACTUAL_FRAMES}, আশা ${EXPECTED_FRAMES})"
+          fi
+          {
+            echo "### ${FORMAT} — সম্পূর্ণ ভিডিও ✅"
+            echo "ফাইল: \`${OUT_FILE}\` — $(du -h "${OUT_FILE}" | cut -f1)"
+            echo "টুকরো: ${#PARTS[@]} টি, ফ্রেম: ${ACTUAL_FRAMES}/${EXPECTED_FRAMES}, দৈর্ঘ্য: ${DURATION} সে"
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: সম্পূর্ণ ভিডিও আর্টিফ্যাক্ট হিসেবে জমা
         uses: actions/upload-artifact@v4
         with:
           name: story-${{ matrix.format }}
-          path: ${{ matrix.format == '4k' && 'out-4k.mp4' || 'out-hd.mp4' }}
+          path: out-${{ matrix.format }}.mp4
           if-no-files-found: error
           retention-days: 14
           compression-level: 0   # MP4 আগে থেকেই সংকুচিত; আবার জিপ করে সময় নষ্ট নয়
@@ -123,7 +298,7 @@ jobs:
     name: Hyperframes ওভারলে (ঐচ্ছিক)
     if: ${{ inputs.hyperframes == true }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # timeout-minutes তুলে দেওয়া হয়েছে (আগে ৬০ মিনিট ছিল)
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
